@@ -28,14 +28,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY setup.py .
 COPY README.md .
 
-RUN pip install --upgrade pip setuptools
-RUN pip install -e ".[interactive-demo]"
+# Step 1: Upgrade pip and install setuptools separately
+RUN /opt/conda/bin/pip install --upgrade pip && /opt/conda/bin/pip install setuptools
+
+# Step 2: Perform the editable install
+RUN /opt/conda/bin/pip install -e ".[interactive-demo]"
 
 # https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/issues/69#issuecomment-1826764707
-RUN rm /opt/conda/bin/ffmpeg && ln -s /bin/ffmpeg /opt/conda/bin/ffmpeg
+RUN ln -s /usr/bin/ffmpeg /opt/conda/bin/ffmpeg
 
-# Make app directory. This directory will host all files required for the
-# backend and SAM 2 inference files.
+# Make app directory
 RUN mkdir ${APP_ROOT}
 
 # Copy backend server files

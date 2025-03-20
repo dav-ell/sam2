@@ -13,6 +13,10 @@ RUN yarn install --frozen-lockfile
 # Copy source code
 COPY . .
 
+# Set API URL as a build-time argument
+ARG REACT_APP_API_URL=http://localhost:7263
+ENV REACT_APP_API_URL=${REACT_APP_API_URL}
+
 # Build the application
 RUN yarn build
 

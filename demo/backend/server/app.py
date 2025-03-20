@@ -25,6 +25,8 @@ from inference.predictor import InferenceAPI
 from strawberry.flask.views import GraphQLView
 
 logger = logging.getLogger(__name__)
+# Force DEBUG logs
+logging.basicConfig(level=logging.DEBUG)
 
 app = Flask(__name__)
 cors = CORS(app, supports_credentials=True)
@@ -81,6 +83,9 @@ def propagate_in_video() -> Response:
         "session_id": data["session_id"],
         "start_frame_index": data.get("start_frame_index", 0),
     }
+    # Required to see session-id for later download
+    # TODO add list-sessions endpoint
+    logger.info(f"propagate_in_video: {args}")
 
     boundary = "frame"
     frame = gen_track_with_mask_stream(boundary, **args)
@@ -92,6 +97,7 @@ def gen_track_with_mask_stream(
     session_id: str,
     start_frame_index: int,
 ) -> Generator[bytes, None, None]:
+    logger.info(f"gen_track_with_mask_stream: {session_id}")
     with inference_api.autocast_context():
         request = PropagateInVideoRequest(
             type="propagate_in_video",

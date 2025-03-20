@@ -24,6 +24,8 @@ from inference.data_types import (
     ClearPointsInVideoResponse,
     CloseSessionRequest,
     CloseSessionResponse,
+    DownloadMasksRequest,
+    DownloadMasksResponse,
     Mask,
     PropagateDataResponse,
     PropagateDataValue,
@@ -35,7 +37,6 @@ from inference.data_types import (
 )
 from pycocotools.mask import decode as decode_masks, encode as encode_masks
 from sam2.build_sam import build_sam2_video_predictor
-
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +354,76 @@ class InferenceAPI:
                 logger.info(
                     f"propagation ended in session {session_id}; {self.__get_session_stats()}"
                 )
+
+    def download_masks(self, request: DownloadMasksRequest) -> DownloadMasksResponse:
+        """
+        Retrieve all masks for all frames in the session after processing is complete.
+        This method now caches masks for each frame so that if masks have already been generated,
+        they are not re-computed.
+        
+        Args:
+            request: The DownloadMasksRequest containing the session_id.
+        
+        Returns:
+            A DownloadMasksResponse containing a list of PropagateDataResponse objects,
+            each representing masks for a specific frame.
+        """
+        with self.autocast_context(), self.inference_lock:
+            session_id = request.session_id
+            logger.info(f"Downloading all masks for session {session_id}")
+
+            session = self.__get_session(session_id)
+            inference_state = session["state"]
+
+            # Initialize a cache for masks if not already present
+            if "masks_cache" not in inference_state:
+                inference_state["masks_cache"] = {}
+
+            num_frames = inference_state.get("num_frames", 0)
+            if num_frames <= 0:
+                logger.warning(f"No frames available in session {session_id}")
+                return DownloadMasksResponse(results=[])
+
+            results = []
+            for frame_idx in range(num_frames):
+                if frame_idx in inference_state["masks_cache"]:
+                    # Use cached mask response if available
+                    results.append(inference_state["masks_cache"][frame_idx])
+                else:
+                    # Compute mask for the frame (if not already computed)
+                    outputs = self.predictor.propagate_in_video(
+                        inference_state=inference_state,
+                        start_frame_idx=frame_idx,
+                        max_frame_num_to_track=1,  # Only process one frame
+                        reverse=False,
+                    )
+                    mask_response = None
+                    for frame_idx_result, obj_ids, video_res_masks in outputs:
+                        masks_binary = (
+                            (video_res_masks > self.score_thresh)[:, 0].cpu().numpy()
+                        )
+                        rle_mask_list = self.__get_rle_mask_list(
+                            object_ids=obj_ids, masks=masks_binary
+                        )
+                        mask_response = PropagateDataResponse(
+                            frame_index=frame_idx_result,
+                            results=rle_mask_list,
+                        )
+                        break
+                    if mask_response is None:
+                        # If no output was generated, default to an empty response
+                        mask_response = PropagateDataResponse(
+                            frame_index=frame_idx,
+                            results=[],
+                        )
+                    # Cache the computed mask response
+                    inference_state["masks_cache"][frame_idx] = mask_response
+                    results.append(mask_response)
+
+            logger.info(
+                f"Completed downloading masks for {len(results)} frames in session {session_id}"
+            )
+            return DownloadMasksResponse(results=results)
 
     def cancel_propagate_in_video(
         self, request: CancelPropagateInVideoRequest

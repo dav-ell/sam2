@@ -28,6 +28,8 @@ from data.data_types import (
     ClearPointsInVideoInput,
     CloseSession,
     CloseSessionInput,
+    DownloadMasksInput,
+    DownloadMasksResponse,
     RemoveObjectInput,
     RLEMask,
     RLEMaskForObject,
@@ -42,10 +44,10 @@ from data.transcoder import get_video_metadata, transcode, VideoMetadata
 from inference.data_types import (
     AddPointsRequest,
     CancelPropagateInVideoRequest,
-    CancelPropagateInVideoRequest,
     ClearPointsInFrameRequest,
     ClearPointsInVideoRequest,
     CloseSessionRequest,
+    DownloadMasksRequest,
     RemoveObjectRequest,
     StartSessionRequest,
 )
@@ -254,6 +256,46 @@ class Mutation:
         )
         response = inference_api.cancel_propagate_in_video(request)
         return CancelPropagateInVideo(success=response.success)
+
+    @strawberry.mutation
+    def download_masks(
+        self, input: DownloadMasksInput, info: strawberry.Info
+    ) -> DownloadMasksResponse:
+        """
+        Retrieve all masks for all frames in the specified session.
+
+        Args:
+            input: The DownloadMasksInput containing the session_id.
+            info: Strawberry context info containing the inference_api.
+
+        Returns:
+            A DownloadMasksResponse with a list of RLEMaskListOnFrame objects.
+        """
+        inference_api: InferenceAPI = info.context["inference_api"]
+
+        request = DownloadMasksRequest(
+            type="download_masks",
+            session_id=input.session_id,
+        )
+        response = inference_api.download_masks(request)
+
+        return DownloadMasksResponse(
+            masks=[
+                RLEMaskListOnFrame(
+                    frame_index=res.frame_index,
+                    rle_mask_list=[
+                        RLEMaskForObject(
+                            object_id=r.object_id,
+                            rle_mask=RLEMask(
+                                counts=r.mask.counts, size=r.mask.size, order="F"
+                            ),
+                        )
+                        for r in res.results
+                    ],
+                )
+                for res in response.results
+            ]
+        )
 
 
 def get_file_hash(video_path_or_file) -> str:

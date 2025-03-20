@@ -122,6 +122,14 @@ class CancelPropagateInVideoRequest(BaseRequest):
 
 @dataclass_json
 @dataclass
+class DownloadMasksRequest(BaseRequest):
+    """Request type for downloading all masks for a session."""
+    type: str
+    session_id: str
+
+
+@dataclass_json
+@dataclass
 class StartSessionResponse:
     session_id: str
 
@@ -180,6 +188,13 @@ class RemoveObjectResponse:
 @dataclass
 class CancelPorpagateResponse:
     success: bool
+
+
+@dataclass_json
+@dataclass
+class DownloadMasksResponse:
+    """Response type containing all masks for all frames in a session."""
+    results: List[PropagateDataResponse]
 
 
 @dataclass_json

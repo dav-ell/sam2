@@ -152,3 +152,15 @@ class SessionExpiration:
     expiration_time: int
     max_expiration_time: int
     ttl: int
+
+
+@strawberry.input
+class DownloadMasksInput:
+    """Input type for downloading all masks for a session."""
+    session_id: str
+
+
+@strawberry.type
+class DownloadMasksResponse:
+    """Response type containing all masks for all frames in a session."""
+    masks: List[RLEMaskListOnFrame]
