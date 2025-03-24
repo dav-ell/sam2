@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import Any, Generator
+from typing import Any, Generator, Tuple
 
 from app_conf import (
     GALLERY_PATH,
@@ -117,6 +117,68 @@ def gen_track_with_mask_stream(
                 },
                 body=chunk.to_json().encode("UTF-8"),
             ).get_message()
+
+
+def gen_frames_stream(boundary: str, session_id: str) -> Generator[bytes, None, None]:
+    """
+    Generate a stream of multipart responses containing JPEG-encoded video frames.
+
+    This function retrieves frames from the InferenceAPI, packages them into multipart
+    responses with appropriate headers, and yields them for streaming to the client.
+
+    Args:
+        boundary: The multipart boundary string used to separate parts in the response.
+        session_id: The ID of the session to retrieve frames from.
+
+    Yields:
+        bytes: Multipart response parts containing JPEG-encoded frame data.
+
+    Raises:
+        RuntimeError: Propagated from InferenceAPI.download_frames if the session is invalid.
+    """
+    logger.info(f"Starting frame streaming for session {session_id}")
+    for frame_idx, jpeg_bytes in inference_api.download_frames(session_id):
+        yield MultipartResponseBuilder.build(
+            boundary=boundary,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Frame-Index": str(frame_idx),
+            },
+            body=jpeg_bytes,
+        ).get_message()
+    logger.info(f"Completed frame streaming for session {session_id}")
+
+
+@app.route("/download_frames", methods=["POST"])
+def download_frames() -> Response:
+    """
+    Endpoint to download video frames for a given session as a stream of JPEG images.
+
+    Expects a JSON body with a 'session_id' field. Returns a multipart response where each
+    part contains a JPEG-encoded frame and its index in the 'Frame-Index' header. This
+    ensures frames are delivered exactly as processed by the server, aligning with masks.
+
+    Returns:
+        Response: A Flask Response object streaming frames with MIME type
+                  'multipart/x-savi-stream'.
+
+    Raises:
+        400: If 'session_id' is missing in the request body.
+        404: If the specified session_id does not exist.
+    """
+    data = request.json
+    session_id = data.get("session_id")
+    if not session_id:
+        logger.error("Received request with missing session_id")
+        return make_response("Missing session_id", 400)
+    if session_id not in inference_api.session_states:
+        logger.error(f"Session {session_id} not found")
+        return make_response(f"Session {session_id} not found", 404)
+
+    logger.info(f"Processing download_frames request for session {session_id}")
+    boundary = "frame"
+    frame_stream = gen_frames_stream(boundary, session_id)
+    return Response(frame_stream, mimetype="multipart/x-savi-stream; boundary=" + boundary)
 
 
 class MyGraphQLView(GraphQLView):

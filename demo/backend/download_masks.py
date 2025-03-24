@@ -38,7 +38,7 @@ def download_masks(session_id: str, endpoint: str) -> List[Dict]:
     logging.info("Setting up GraphQL client with endpoint %s", endpoint)
     # Set up the GraphQL client
     transport = AIOHTTPTransport(url=endpoint)
-    client = Client(transport=transport, fetch_schema_from_transport=True, execute_timeout=300)
+    client = Client(transport=transport, fetch_schema_from_transport=True, execute_timeout=3600)
 
     # Define the GraphQL mutation
     query = gql("""

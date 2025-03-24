@@ -9,7 +9,7 @@ import os
 import uuid
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Generator, List
+from typing import Any, Dict, Generator, List, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,8 @@ from inference.data_types import (
     StartSessionRequest,
     StartSessionResponse,
 )
+from PIL import Image
+from io import BytesIO
 from pycocotools.mask import decode as decode_masks, encode as encode_masks
 from sam2.build_sam import build_sam2_video_predictor
 
@@ -294,6 +296,11 @@ class InferenceAPI:
                 session["canceled"] = False
 
                 inference_state = session["state"]
+
+                # Initialize the masks cache if it does not exist.
+                if "masks_cache" not in inference_state:
+                    inference_state["masks_cache"] = {}
+
                 if propagation_direction not in ["both", "forward", "backward"]:
                     raise ValueError(
                         f"invalid propagation direction: {propagation_direction}"
@@ -319,10 +326,15 @@ class InferenceAPI:
                             object_ids=obj_ids, masks=masks_binary
                         )
 
-                        yield PropagateDataResponse(
+                        response = PropagateDataResponse(
                             frame_index=frame_idx,
                             results=rle_mask_list,
                         )
+
+                        # Cache the mask response
+                        inference_state["masks_cache"][frame_idx] = response
+
+                        yield response
 
                 # Then doing the backward propagation (reverse in time)
                 if propagation_direction in ["both", "backward"]:
@@ -344,10 +356,15 @@ class InferenceAPI:
                             object_ids=obj_ids, masks=masks_binary
                         )
 
-                        yield PropagateDataResponse(
+                        response = PropagateDataResponse(
                             frame_index=frame_idx,
                             results=rle_mask_list,
                         )
+
+                        # Cache the mask response
+                        inference_state["masks_cache"][frame_idx] = response
+
+                        yield response
             finally:
                 # Log upon completion (so that e.g. we can see if two propagations happen in parallel).
                 # Using `finally` here to log even when the tracking is aborted with GeneratorExit.
@@ -424,6 +441,63 @@ class InferenceAPI:
                 f"Completed downloading masks for {len(results)} frames in session {session_id}"
             )
             return DownloadMasksResponse(results=results)
+        
+    def download_frames(self, session_id: str) -> Generator[Tuple[int, bytes], None, None]:
+        """
+        Yield video frames as JPEG-encoded bytes along with their frame indices for a given session.
+
+        This method retrieves the frames stored in the session's inference state, converts them from
+        tensor format to JPEG images, and yields them for streaming. The frames are the exact ones
+        used during mask propagation, ensuring alignment with the masks.
+
+        Args:
+            session_id: The ID of the session to retrieve frames from.
+
+        Yields:
+            Tuple[int, bytes]: A tuple containing the frame index (int) and the JPEG-encoded frame
+            data (bytes).
+
+        Raises:
+            RuntimeError: If the session_id does not exist in session_states.
+        """
+        logger.info(f"Starting frame download for session {session_id}")
+        session = self.__get_session(session_id)
+        inference_state = session["state"]
+
+        # Validate frame availability
+        if "images" not in inference_state:
+            logger.error(f"No frames found in inference state for session {session_id}")
+            raise RuntimeError(f"Session {session_id} has no frames available")
+        
+        video_frames = inference_state["images"]
+        num_frames = len(video_frames)
+        logger.info(f"Found {num_frames} frames in session {session_id}")
+
+        if num_frames == 0:
+            logger.warning(f"Session {session_id} contains zero frames")
+            return
+
+        for frame_idx, frame_tensor in enumerate(video_frames):
+            try:
+                # Ensure tensor is on CPU and in correct format
+                frame_tensor = frame_tensor.cpu()
+                if frame_tensor.dtype != torch.float32 or frame_tensor.max() > 1.0:
+                    logger.warning(f"Frame {frame_idx} has unexpected format, normalizing")
+                    frame_tensor = frame_tensor.float() / 255.0 if frame_tensor.max() > 1.0 else frame_tensor
+                
+                frame_np = (frame_tensor * 255).byte().numpy()  # [H, W, C], uint8
+                frame_pil = Image.fromarray(frame_np)
+                buf = BytesIO()
+                frame_pil.save(buf, format="JPEG", quality=85)
+                jpeg_bytes = buf.getvalue()
+                buf.close()
+                logger.debug(f"Encoded frame {frame_idx} as JPEG, size: {len(jpeg_bytes)} bytes")
+                yield frame_idx, jpeg_bytes
+            except Exception as e:
+                logger.error(f"Failed to process frame {frame_idx} in session {session_id}: {str(e)}")
+                raise RuntimeError(f"Error processing frame {frame_idx}: {str(e)}")
+
+        logger.info(f"Completed frame download for session {session_id}, total frames: {num_frames}")
 
     def cancel_propagate_in_video(
         self, request: CancelPropagateInVideoRequest
