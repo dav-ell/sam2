@@ -167,8 +167,6 @@ export default class OverlayEffect extends BaseGLEffect {
       const mask = context.masks[index];
       const decodedMask = decode([mask.bitmap as RLEObject]);
       const maskData = decodedMask.data as Uint8Array;
-      console.log(`Applying mask ${index} with width ${decodedMask.width}, height ${decodedMask.height}, data length ${maskData.length}`);
-
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texSubImage3D(
         gl.TEXTURE_2D_ARRAY,

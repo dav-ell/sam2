@@ -29,7 +29,7 @@ COPY setup.py .
 COPY README.md .
 
 # Step 1: Upgrade pip and install setuptools separately
-RUN /opt/conda/bin/pip install --upgrade pip && /opt/conda/bin/pip install setuptools
+RUN /opt/conda/bin/pip install --upgrade pip && /opt/conda/bin/pip install setuptools opencv-python-headless
 
 # Step 2: Perform the editable install
 RUN /opt/conda/bin/pip install -e ".[interactive-demo]"

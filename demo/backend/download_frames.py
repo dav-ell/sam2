@@ -45,14 +45,17 @@ def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, byte
 
     # Stream the response to handle large videos efficiently
     try:
-        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
+        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=3600)
         response.raise_for_status()
     except requests.RequestException as e:
         logging.exception("Failed to initiate frame download for session %s", session_id)
         raise requests.RequestException(f"Failed to download frames: {str(e)}")
 
-    if response.headers.get("Content-Type", "").startswith("multipart/x-savi-stream"):
-        boundary = b"--" + response.headers["Content-Type"].split("boundary=")[1].encode("utf-8")
+    content_type = response.headers.get("Content-Type", "")
+    if content_type.startswith("multipart/x-savi-stream"):
+        # Extract the boundary string without CRLF
+        boundary_str = response.headers["Content-Type"].split("boundary=")[1]
+        boundary = b"--" + boundary_str.encode("utf-8")
     else:
         raise ValueError("Unexpected response Content-Type; expected multipart/x-savi-stream")
 
@@ -60,19 +63,30 @@ def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, byte
     frame_count = 0
     for chunk in response.iter_content(chunk_size=8192):
         buffer += chunk
-        while b"\r\n" + boundary in buffer:
-            part, buffer = buffer.split(b"\r\n" + boundary, 1)
-            if part.strip():
-                try:
-                    headers, body = part.split(b"\r\n\r\n", 1)
-                    headers = BytesParser().parsebytes(headers)
-                    frame_idx = int(headers["Frame-Index"])
-                    frame_data = body.strip()
-                    yield frame_idx, frame_data
-                    frame_count += 1
-                except Exception as e:
-                    logging.error("Failed to parse multipart part: %s", str(e))
+        # Process complete parts as long as the boundary is found
+        while boundary in buffer:
+            part, buffer = buffer.split(boundary, 1)
+            part = part.strip(b"\r\n")
+            if not part:
+                continue
+            try:
+                # Each part should have headers and body separated by a blank line.
+                if b"\r\n\r\n" not in part:
+                    logging.error("Incomplete multipart part encountered; skipping part")
                     continue
+                headers_part, body = part.split(b"\r\n\r\n", 1)
+                headers_obj = BytesParser().parsebytes(headers_part)
+                frame_index_value = headers_obj.get("Frame-Index")
+                if frame_index_value is None:
+                    logging.error("Missing Frame-Index header in multipart part; skipping part")
+                    continue
+                frame_idx = int(frame_index_value)
+                frame_data = body.strip()
+                yield frame_idx, frame_data
+                frame_count += 1
+            except Exception as e:
+                logging.error("Failed to parse multipart part: %s", str(e))
+                continue
     logging.info("Downloaded %d frames for session %s", frame_count, session_id)
 
 

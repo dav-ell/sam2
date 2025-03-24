@@ -13,7 +13,7 @@ from typing import Any, Dict, Generator, List, Tuple
 
 import numpy as np
 import torch
-from app_conf import APP_ROOT, MODEL_SIZE
+from app_conf import APP_ROOT, MODEL_SIZE, DATA_PATH
 from inference.data_types import (
     AddMaskRequest,
     AddPointsRequest,
@@ -40,10 +40,16 @@ from io import BytesIO
 from pycocotools.mask import decode as decode_masks, encode as encode_masks
 from sam2.build_sam import build_sam2_video_predictor
 
+import cv2  # <--- We import OpenCV to read frames in original shape
+
 logger = logging.getLogger(__name__)
 
-
 class InferenceAPI:
+    """
+    Core class responsible for managing inference sessions, storing their state,
+    and performing image/video segmentation. Also supports streaming frames to
+    clients via /download_frames.
+    """
 
     def __init__(self) -> None:
         super(InferenceAPI, self).__init__()
@@ -51,6 +57,7 @@ class InferenceAPI:
         self.session_states: Dict[str, Any] = {}
         self.score_thresh = 0
 
+        # Choose checkpoint & config based on MODEL_SIZE
         if MODEL_SIZE == "tiny":
             checkpoint = Path(APP_ROOT) / "checkpoints/sam2.1_hiera_tiny.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
@@ -64,28 +71,27 @@ class InferenceAPI:
             checkpoint = Path(APP_ROOT) / "checkpoints/sam2.1_hiera_base_plus.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 
-        # select the device for computation
+        # Select device
         force_cpu_device = os.environ.get("SAM2_DEMO_FORCE_CPU_DEVICE", "0") == "1"
         if force_cpu_device:
-            logger.info("forcing CPU device for SAM 2 demo")
+            logger.info("Forcing CPU device for SAM 2 demo")
         if torch.cuda.is_available() and not force_cpu_device:
             device = torch.device("cuda")
         elif torch.backends.mps.is_available() and not force_cpu_device:
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
-        logger.info(f"using device: {device}")
+        logger.info(f"Using device: {device}")
 
+        # Turn on TF32 if on a supported GPU
         if device.type == "cuda":
-            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
             if torch.cuda.get_device_properties(0).major >= 8:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
         elif device.type == "mps":
             logging.warning(
                 "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
-                "give numerically different outputs and sometimes degraded performance on MPS. "
-                "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
+                "give numerically different outputs and sometimes degraded performance on MPS."
             )
 
         self.device = device
@@ -95,21 +101,60 @@ class InferenceAPI:
         self.inference_lock = Lock()
 
     def autocast_context(self):
+        """
+        Returns the appropriate autocast (automatic mixed precision) context
+        if running on CUDA, otherwise a no-op context.
+        """
         if self.device.type == "cuda":
             return torch.autocast("cuda", dtype=torch.bfloat16)
         else:
             return contextlib.nullcontext()
 
+    def _read_raw_frames(self, path: str) -> List[np.ndarray]:
+        """
+        Utility to read original frames from a video (using OpenCV),
+        preserving the original resolution and color arrangement (BGR).
+        """
+        video_path = str(Path(DATA_PATH) / path)  # The same path that start_session uses
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"Could not open video at {video_path}")
+            return []
+
+        frames = []
+        frame_index = 0
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            # 'frame_bgr' is 720×1280×3 if your final video is 1280×720
+            frames.append(frame_bgr)
+            frame_index += 1
+        cap.release()
+        logger.info(f"Loaded {len(frames)} raw frames from {video_path}")
+        return frames
+
     def start_session(self, request: StartSessionRequest) -> StartSessionResponse:
+        """
+        Starts an inference session for the given video path, returning a new session_id.
+        Also stores the original frames (in 1280×720) so the user can download them
+        later without the model's resizing or normalization.
+        """
         with self.autocast_context(), self.inference_lock:
             session_id = str(uuid.uuid4())
-            # for MPS devices, we offload the video frames to CPU by default to avoid
-            # memory fragmentation in MPS (which sometimes crashes the entire process)
+
+            # In case of MPS device, we offload frames to CPU to avoid memory fragmentation
             offload_video_to_cpu = self.device.type == "mps"
             inference_state = self.predictor.init_state(
                 request.path,
                 offload_video_to_cpu=offload_video_to_cpu,
             )
+
+            # Additionally, read the raw frames from the same video path.
+            raw_frames = self._read_raw_frames(request.path)
+            # Store them in the same inference_state for later retrieval:
+            inference_state["images_original"] = raw_frames
+
             self.session_states[session_id] = {
                 "canceled": False,
                 "state": inference_state,
@@ -117,12 +162,17 @@ class InferenceAPI:
             return StartSessionResponse(session_id=session_id)
 
     def close_session(self, request: CloseSessionRequest) -> CloseSessionResponse:
+        """
+        Closes an inference session (frees memory) for the given session_id.
+        """
         is_successful = self.__clear_session_state(request.session_id)
         return CloseSessionResponse(success=is_successful)
 
-    def add_points(
-        self, request: AddPointsRequest, test: str = ""
-    ) -> PropagateDataResponse:
+    def add_points(self, request: AddPointsRequest, test: str = "") -> PropagateDataResponse:
+        """
+        Add new point prompts to a specific frame. The model immediately updates
+        that frame's segmentation mask for the targeted object.
+        """
         with self.autocast_context(), self.inference_lock:
             session = self.__get_session(request.session_id)
             inference_state = session["state"]
@@ -133,7 +183,7 @@ class InferenceAPI:
             labels = request.labels
             clear_old_points = request.clear_old_points
 
-            # add new prompts and instantly get the output on the same frame
+            # Add the new prompt
             frame_idx, object_ids, masks = self.predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=frame_idx,
@@ -145,7 +195,6 @@ class InferenceAPI:
             )
 
             masks_binary = (masks > self.score_thresh)[:, 0].cpu().numpy()
-
             rle_mask_list = self.__get_rle_mask_list(
                 object_ids=object_ids, masks=masks_binary
             )
@@ -157,9 +206,7 @@ class InferenceAPI:
 
     def add_mask(self, request: AddMaskRequest) -> PropagateDataResponse:
         """
-        Add new points on a specific video frame.
-        - mask is a numpy array of shape [H_im, W_im] (containing 1 for foreground and 0 for background).
-        Note: providing an input mask would overwrite any previous input points on this frame.
+        Add a mask prompt directly (mask is an array of size [H, W], 1 for FG, 0 for BG).
         """
         with self.autocast_context(), self.inference_lock:
             session_id = request.session_id
@@ -178,7 +225,7 @@ class InferenceAPI:
             session = self.__get_session(session_id)
             inference_state = session["state"]
 
-            frame_idx, obj_ids, video_res_masks = self.model.add_new_mask(
+            frame_idx, obj_ids, video_res_masks = self.predictor.add_new_mask(
                 inference_state=inference_state,
                 frame_idx=frame_idx,
                 obj_id=obj_id,
@@ -199,7 +246,7 @@ class InferenceAPI:
         self, request: ClearPointsInFrameRequest
     ) -> PropagateDataResponse:
         """
-        Remove all input points in a specific frame.
+        Remove all point prompts in a specific frame for a specified object.
         """
         with self.autocast_context(), self.inference_lock:
             session_id = request.session_id
@@ -231,7 +278,7 @@ class InferenceAPI:
         self, request: ClearPointsInVideoRequest
     ) -> ClearPointsInVideoResponse:
         """
-        Remove all input points in all frames throughout the video.
+        Remove all point prompts across all frames of the video.
         """
         with self.autocast_context(), self.inference_lock:
             session_id = request.session_id
@@ -243,7 +290,7 @@ class InferenceAPI:
 
     def remove_object(self, request: RemoveObjectRequest) -> RemoveObjectResponse:
         """
-        Remove an object id from the tracking state.
+        Remove a specific object ID from the tracking state.
         """
         with self.autocast_context(), self.inference_lock:
             session_id = request.session_id
@@ -273,18 +320,15 @@ class InferenceAPI:
     def propagate_in_video(
         self, request: PropagateInVideoRequest
     ) -> Generator[PropagateDataResponse, None, None]:
+        """
+        Propagate existing point prompts throughout the video to track objects in all frames.
+        Yields partial results as they are computed (streaming).
+        """
         session_id = request.session_id
         start_frame_idx = request.start_frame_index
         propagation_direction = "both"
         max_frame_num_to_track = None
 
-        """
-        Propagate existing input points in all frames to track the object across video.
-        """
-
-        # Note that as this method is a generator, we also need to use autocast_context
-        # in caller to this method to ensure that it's called under the correct context
-        # (we've added `autocast_context` to `gen_track_with_mask_stream` in app.py).
         with self.autocast_context(), self.inference_lock:
             logger.info(
                 f"propagate in video in session {session_id}: "
@@ -294,19 +338,13 @@ class InferenceAPI:
             try:
                 session = self.__get_session(session_id)
                 session["canceled"] = False
-
                 inference_state = session["state"]
 
-                # Initialize the masks cache if it does not exist.
+                # Initialize masks cache if needed
                 if "masks_cache" not in inference_state:
                     inference_state["masks_cache"] = {}
 
-                if propagation_direction not in ["both", "forward", "backward"]:
-                    raise ValueError(
-                        f"invalid propagation direction: {propagation_direction}"
-                    )
-
-                # First doing the forward propagation
+                # Forward pass
                 if propagation_direction in ["both", "forward"]:
                     for outputs in self.predictor.propagate_in_video(
                         inference_state=inference_state,
@@ -325,18 +363,14 @@ class InferenceAPI:
                         rle_mask_list = self.__get_rle_mask_list(
                             object_ids=obj_ids, masks=masks_binary
                         )
-
                         response = PropagateDataResponse(
                             frame_index=frame_idx,
                             results=rle_mask_list,
                         )
-
-                        # Cache the mask response
                         inference_state["masks_cache"][frame_idx] = response
-
                         yield response
 
-                # Then doing the backward propagation (reverse in time)
+                # Backward pass
                 if propagation_direction in ["both", "backward"]:
                     for outputs in self.predictor.propagate_in_video(
                         inference_state=inference_state,
@@ -355,35 +389,21 @@ class InferenceAPI:
                         rle_mask_list = self.__get_rle_mask_list(
                             object_ids=obj_ids, masks=masks_binary
                         )
-
                         response = PropagateDataResponse(
                             frame_index=frame_idx,
                             results=rle_mask_list,
                         )
-
-                        # Cache the mask response
                         inference_state["masks_cache"][frame_idx] = response
-
                         yield response
             finally:
-                # Log upon completion (so that e.g. we can see if two propagations happen in parallel).
-                # Using `finally` here to log even when the tracking is aborted with GeneratorExit.
                 logger.info(
                     f"propagation ended in session {session_id}; {self.__get_session_stats()}"
                 )
 
     def download_masks(self, request: DownloadMasksRequest) -> DownloadMasksResponse:
         """
-        Retrieve all masks for all frames in the session after processing is complete.
-        This method now caches masks for each frame so that if masks have already been generated,
-        they are not re-computed.
-        
-        Args:
-            request: The DownloadMasksRequest containing the session_id.
-        
-        Returns:
-            A DownloadMasksResponse containing a list of PropagateDataResponse objects,
-            each representing masks for a specific frame.
+        Retrieve all masks for all frames in the specified session. This uses
+        a cache to avoid recomputing masks if they've already been generated.
         """
         with self.autocast_context(), self.inference_lock:
             session_id = request.session_id
@@ -392,7 +412,6 @@ class InferenceAPI:
             session = self.__get_session(session_id)
             inference_state = session["state"]
 
-            # Initialize a cache for masks if not already present
             if "masks_cache" not in inference_state:
                 inference_state["masks_cache"] = {}
 
@@ -404,14 +423,13 @@ class InferenceAPI:
             results = []
             for frame_idx in range(num_frames):
                 if frame_idx in inference_state["masks_cache"]:
-                    # Use cached mask response if available
                     results.append(inference_state["masks_cache"][frame_idx])
                 else:
-                    # Compute mask for the frame (if not already computed)
+                    # Compute mask for the frame
                     outputs = self.predictor.propagate_in_video(
                         inference_state=inference_state,
                         start_frame_idx=frame_idx,
-                        max_frame_num_to_track=1,  # Only process one frame
+                        max_frame_num_to_track=1,
                         reverse=False,
                     )
                     mask_response = None
@@ -428,12 +446,9 @@ class InferenceAPI:
                         )
                         break
                     if mask_response is None:
-                        # If no output was generated, default to an empty response
                         mask_response = PropagateDataResponse(
-                            frame_index=frame_idx,
-                            results=[],
+                            frame_index=frame_idx, results=[]
                         )
-                    # Cache the computed mask response
                     inference_state["masks_cache"][frame_idx] = mask_response
                     results.append(mask_response)
 
@@ -441,67 +456,84 @@ class InferenceAPI:
                 f"Completed downloading masks for {len(results)} frames in session {session_id}"
             )
             return DownloadMasksResponse(results=results)
-        
+
     def download_frames(self, session_id: str) -> Generator[Tuple[int, bytes], None, None]:
         """
-        Yield video frames as JPEG-encoded bytes along with their frame indices for a given session.
+        Yield video frames as JPEG-encoded bytes, along with their frame indices, for a given session.
 
-        This method retrieves the frames stored in the session's inference state, converts them from
-        tensor format to JPEG images, and yields them for streaming. The frames are the exact ones
-        used during mask propagation, ensuring alignment with the masks.
+        Now we serve from "images_original" (the 1280×720 frames read with OpenCV),
+        rather than the 1024×1024 model data. This ensures correct resolution and color.
+
+        1. We retrieve the frames from "images_original" (shape is [H, W, 3] BGR).
+        2. Convert from BGR to RGB, then encode to JPEG.
+        3. Yield (frame_index, jpeg_bytes).
 
         Args:
-            session_id: The ID of the session to retrieve frames from.
+            session_id: The ID of the session whose frames we want to stream.
 
         Yields:
-            Tuple[int, bytes]: A tuple containing the frame index (int) and the JPEG-encoded frame
-            data (bytes).
+            (frame_idx, jpeg_bytes) for each frame in the original resolution & color.
 
         Raises:
-            RuntimeError: If the session_id does not exist in session_states.
+            RuntimeError: If the session or frames do not exist.
         """
         logger.info(f"Starting frame download for session {session_id}")
         session = self.__get_session(session_id)
         inference_state = session["state"]
 
-        # Validate frame availability
-        if "images" not in inference_state:
-            logger.error(f"No frames found in inference state for session {session_id}")
-            raise RuntimeError(f"Session {session_id} has no frames available")
-        
-        video_frames = inference_state["images"]
+        # We changed this: serve from "images_original"
+        if "images_original" not in inference_state:
+            logger.error(f"No original frames found for session {session_id}")
+            raise RuntimeError(f"Session {session_id} has no 'images_original' data")
+
+        video_frames = inference_state["images_original"]
         num_frames = len(video_frames)
-        logger.info(f"Found {num_frames} frames in session {session_id}")
+        logger.info(
+            f"Found {num_frames} raw frames in session {session_id}"
+        )
 
         if num_frames == 0:
-            logger.warning(f"Session {session_id} contains zero frames")
+            logger.warning(f"Session {session_id} contains zero frames (original)")
             return
 
-        for frame_idx, frame_tensor in enumerate(video_frames):
+        for frame_idx, frame_bgr in enumerate(video_frames):
             try:
-                # Ensure tensor is on CPU and in correct format
-                frame_tensor = frame_tensor.cpu()
-                if frame_tensor.dtype != torch.float32 or frame_tensor.max() > 1.0:
-                    logger.warning(f"Frame {frame_idx} has unexpected format, normalizing")
-                    frame_tensor = frame_tensor.float() / 255.0 if frame_tensor.max() > 1.0 else frame_tensor
-                
-                frame_np = (frame_tensor * 255).byte().numpy()  # [H, W, C], uint8
-                frame_pil = Image.fromarray(frame_np)
+                # frame_bgr is a NumPy array in [H, W, 3] with BGR channels
+                logger.debug(
+                    f"Frame {frame_idx} BGR shape: {frame_bgr.shape}, dtype: {frame_bgr.dtype}"
+                )
+
+                # Convert BGR→RGB
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+                # Turn into a PIL image
+                frame_pil = Image.fromarray(frame_rgb)
                 buf = BytesIO()
                 frame_pil.save(buf, format="JPEG", quality=85)
                 jpeg_bytes = buf.getvalue()
                 buf.close()
-                logger.debug(f"Encoded frame {frame_idx} as JPEG, size: {len(jpeg_bytes)} bytes")
+
+                logger.debug(
+                    f"Encoded frame {frame_idx} as JPEG, size: {len(jpeg_bytes)} bytes"
+                )
                 yield frame_idx, jpeg_bytes
+
             except Exception as e:
-                logger.error(f"Failed to process frame {frame_idx} in session {session_id}: {str(e)}")
+                logger.error(
+                    f"Failed to process frame {frame_idx} in session {session_id}: {str(e)}"
+                )
                 raise RuntimeError(f"Error processing frame {frame_idx}: {str(e)}")
 
-        logger.info(f"Completed frame download for session {session_id}, total frames: {num_frames}")
+        logger.info(
+            f"Completed frame download for session {session_id}, total frames: {num_frames}"
+        )
 
     def cancel_propagate_in_video(
         self, request: CancelPropagateInVideoRequest
     ) -> CancelPorpagateResponse:
+        """
+        Cancels an ongoing forward/backward propagation for the specified session.
+        """
         session = self.__get_session(request.session_id)
         session["canceled"] = True
         return CancelPorpagateResponse(success=True)
@@ -510,7 +542,7 @@ class InferenceAPI:
         self, object_ids: List[int], masks: np.ndarray
     ) -> List[PropagateDataValue]:
         """
-        Return a list of data values, i.e. list of object/mask combos.
+        Return a list of data values (object ID plus mask) for each object.
         """
         return [
             self.__get_mask_for_object(object_id=object_id, mask=mask)
@@ -521,7 +553,7 @@ class InferenceAPI:
         self, object_id: int, mask: np.ndarray
     ) -> PropagateDataValue:
         """
-        Create a data value for an object/mask combo.
+        Create a data value for an object/mask pair.
         """
         mask_rle = encode_masks(np.array(mask, dtype=np.uint8, order="F"))
         mask_rle["counts"] = mask_rle["counts"].decode()
@@ -534,6 +566,9 @@ class InferenceAPI:
         )
 
     def __get_session(self, session_id: str):
+        """
+        Safely retrieve a session by ID, or raise an error if it doesn't exist.
+        """
         session = self.session_states.get(session_id, None)
         if session is None:
             raise RuntimeError(
@@ -542,24 +577,37 @@ class InferenceAPI:
         return session
 
     def __get_session_stats(self):
-        """Get a statistics string for live sessions and their GPU usage."""
-        # print both the session ids and their video frame numbers
-        live_session_strs = [
-            f"'{session_id}' ({session['state']['num_frames']} frames, "
-            f"{len(session['state']['obj_ids'])} objects)"
-            for session_id, session in self.session_states.items()
-        ]
+        """
+        Return a string summarizing all active sessions and GPU usage (for debugging).
+        """
+        live_session_strs = []
+        for sid, sdata in self.session_states.items():
+            frames = sdata["state"].get("num_frames", 0)
+            objs = len(sdata["state"].get("obj_ids", []))
+            live_session_strs.append(f"'{sid}' ({frames} frames, {objs} objects)")
+
+        if torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() // 1024**2
+            mem_reserved = torch.cuda.memory_reserved() // 1024**2
+            mem_alloc_max = torch.cuda.max_memory_allocated() // 1024**2
+            mem_reserved_max = torch.cuda.max_memory_reserved() // 1024**2
+            mem_str = (
+                f"{mem_alloc} MiB used, {mem_reserved} MiB reserved (max: "
+                f"{mem_alloc_max} / {mem_reserved_max})"
+            )
+        else:
+            mem_str = "GPU not in use"
+
         session_stats_str = (
-            "Test String Here - -"
-            f"live sessions: [{', '.join(live_session_strs)}], GPU memory: "
-            f"{torch.cuda.memory_allocated() // 1024**2} MiB used and "
-            f"{torch.cuda.memory_reserved() // 1024**2} MiB reserved"
-            f" (max over time: {torch.cuda.max_memory_allocated() // 1024**2} MiB used "
-            f"and {torch.cuda.max_memory_reserved() // 1024**2} MiB reserved)"
+            f"Live sessions: [{', '.join(live_session_strs)}], GPU mem: {mem_str}"
         )
         return session_stats_str
 
     def __clear_session_state(self, session_id: str) -> bool:
+        """
+        Remove the session from memory. Returns True if successfully removed,
+        otherwise False.
+        """
         session = self.session_states.pop(session_id, None)
         if session is None:
             logger.warning(
