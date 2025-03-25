@@ -4,7 +4,7 @@
 Script to download all video frames for a given session from the SAM 2 backend and save them to disk as JPEG images.
 
 Usage:
-    python download_frames.py --session-id <SESSION_ID> --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT>]
+    python download_frames.py [--session-id <SESSION_ID>] --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT>] [--graphql-endpoint <GRAPHQL_ENDPOINT>]
 
 Requirements:
     - pip install requests tqdm
@@ -13,11 +13,95 @@ Requirements:
 import argparse
 import logging
 import os
-from typing import Generator, Tuple
+from typing import Generator, Tuple, List, Dict
 
 import requests
 from email.parser import BytesParser
 from tqdm import tqdm
+
+
+def list_sessions(endpoint: str) -> List[Dict]:
+    """
+    Retrieve a list of active inference sessions from the backend.
+
+    Args:
+        endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
+
+    Returns:
+        A list of dictionaries containing session metadata:
+        [
+            {
+                "sessionId": str,
+                "startTime": float,
+                "lastUseTime": float,
+                "numFrames": int,
+                "numObjects": int
+            },
+            ...
+        ]
+
+    Raises:
+        Exception: If the GraphQL request fails or the response is invalid.
+    """
+    logging.info("Fetching list of active sessions from %s", endpoint)
+    query = """
+    query {
+        sessions {
+            sessionId
+            startTime
+            lastUseTime
+            numFrames
+            numObjects
+        }
+    }
+    """
+    headers = {"Content-Type": "application/json"}
+    try:
+        response = requests.post(endpoint, json={"query": query}, headers=headers, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        if "errors" in result:
+            raise Exception(result["errors"])
+        sessions = result["data"]["sessions"]
+        logging.info("Found %d active sessions", len(sessions))
+        return sessions
+    except Exception as e:
+        logging.exception("Failed to list sessions")
+        raise Exception(f"Failed to list sessions: {str(e)}")
+
+
+def select_session(sessions: List[Dict]) -> str:
+    """
+    Prompt the user to select a session from a list of active sessions.
+
+    Args:
+        sessions: List of session metadata dictionaries.
+
+    Returns:
+        str: The selected session ID.
+
+    Raises:
+        SystemExit: If the user input is invalid or they choose to exit.
+    """
+    print("\nMultiple active sessions found:")
+    for i, session in enumerate(sessions, 1):
+        print(f"{i}. Session ID: {session['sessionId']}, Frames: {session['numFrames']}, Objects: {session['numObjects']}")
+    print(f"{len(sessions) + 1}. Exit")
+    
+    while True:
+        try:
+            choice = int(input(f"\nEnter the number of the session to download (1-{len(sessions) + 1}): "))
+            if choice == len(sessions) + 1:
+                logging.info("User chose to exit")
+                raise SystemExit("Exiting at user request.")
+            if 1 <= choice <= len(sessions):
+                selected_session = sessions[choice - 1]["sessionId"]
+                logging.info("User selected session %s", selected_session)
+                return selected_session
+            else:
+                print(f"Please enter a number between 1 and {len(sessions) + 1}.")
+        except ValueError:
+            print("Please enter a valid number.")
 
 
 def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, bytes], None, None]:
@@ -129,8 +213,8 @@ def main():
     )
     parser.add_argument(
         "--session-id",
-        required=True,
-        help="The session ID to download frames for."
+        required=False,
+        help="The session ID to download frames for. If not provided, the script will list active sessions."
     )
     parser.add_argument(
         "--output-dir",
@@ -140,7 +224,12 @@ def main():
     parser.add_argument(
         "--endpoint",
         default="http://localhost:5000/download_frames",
-        help="Endpoint URL (default: http://localhost:5000/download_frames)."
+        help="Endpoint URL for downloading frames (default: http://localhost:5000/download_frames)."
+    )
+    parser.add_argument(
+        "--graphql-endpoint",
+        default="http://localhost:5000/graphql",
+        help="GraphQL endpoint URL for listing sessions (default: http://localhost:5000/graphql)."
     )
 
     args = parser.parse_args()
@@ -151,13 +240,34 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
-    logging.info("Starting frame download for session %s", args.session_id)
     try:
-        # Download frames from the backend
-        frames = download_frames(args.session_id, args.endpoint)
+        # If session_id is provided, use it directly; otherwise, list sessions
+        if args.session_id:
+            session_id = args.session_id
+            logging.info("Using provided session ID: %s", session_id)
+        else:
+            # Fetch active sessions using the GraphQL endpoint
+            sessions = list_sessions(args.graphql_endpoint)
+            if not sessions:
+                logging.error("No active sessions found")
+                print("No active sessions found. Please start a session first.")
+                exit(1)
+            elif len(sessions) == 1:
+                session_id = sessions[0]["sessionId"]
+                logging.info("Automatically selected the only session: %s", session_id)
+                print(f"Using the only active session: {session_id}")
+            else:
+                session_id = select_session(sessions)
+        
+        logging.info("Starting frame download for session %s", session_id)
+        # Download frames from the backend using the frames endpoint
+        frames = download_frames(session_id, args.endpoint)
         # Save frames to disk
         save_frames_to_disk(frames, args.output_dir)
         logging.info("Successfully downloaded and saved frames to %s", args.output_dir)
+    except SystemExit as e:
+        logging.info(str(e))
+        exit(0)
     except Exception as e:
         logging.exception("An error occurred during processing:")
         exit(1)

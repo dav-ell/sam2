@@ -122,14 +122,6 @@ class CancelPropagateInVideoRequest(BaseRequest):
 
 @dataclass_json
 @dataclass
-class DownloadMasksRequest(BaseRequest):
-    """Request type for downloading all masks for a session."""
-    type: str
-    session_id: str
-
-
-@dataclass_json
-@dataclass
 class StartSessionResponse:
     session_id: str
 
@@ -192,15 +184,23 @@ class CancelPorpagateResponse:
 
 @dataclass_json
 @dataclass
-class DownloadMasksResponse:
-    """Response type containing all masks for all frames in a session."""
-    results: List[PropagateDataResponse]
-
-
-@dataclass_json
-@dataclass
 class InferenceSession:
     start_time: float
     last_use_time: float
     session_id: str
     state: Dict[str, Dict[str, Union[Tensor, Dict[int, Tensor]]]]
+
+@dataclass_json
+@dataclass
+class DownloadMasksRequest(BaseRequest):
+    """
+    Inference request type for downloading masks.
+    Contains the session ID for which masks are requested.
+    """
+    type: str
+    session_id: str
+    
+@dataclass_json
+@dataclass
+class DownloadMasksResponse:
+    results: List[PropagateDataResponse]

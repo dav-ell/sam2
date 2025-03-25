@@ -21,7 +21,7 @@ from flask import Flask, make_response, Request, request, Response, send_from_di
 from flask_cors import CORS
 from inference.data_types import PropagateDataResponse, PropagateInVideoRequest
 from inference.multipart import MultipartResponseBuilder
-from inference.predictor import InferenceAPI
+from inference.inference_api import InferenceAPI
 from strawberry.flask.views import GraphQLView
 
 logger = logging.getLogger(__name__)

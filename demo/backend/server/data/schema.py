@@ -30,10 +30,15 @@ from data.data_types import (
     CloseSessionInput,
     DownloadMasksInput,
     DownloadMasksResponse,
+    DownloadBoxesInput,
+    YOLOBoxForObject,
+    BoxesListOnFrame,
+    DownloadBoxesResponse,
     RemoveObjectInput,
     RLEMask,
     RLEMaskForObject,
     RLEMaskListOnFrame,
+    SessionInfo,  # Added new import
     StartSession,
     StartSessionInput,
     Video,
@@ -48,10 +53,11 @@ from inference.data_types import (
     ClearPointsInVideoRequest,
     CloseSessionRequest,
     DownloadMasksRequest,
+    PropagateDataResponse,
     RemoveObjectRequest,
     StartSessionRequest,
 )
-from inference.predictor import InferenceAPI
+from inference.inference_api import InferenceAPI
 from strawberry import relay
 from strawberry.file_uploads import Upload
 
@@ -88,6 +94,20 @@ class Query:
         """
         all_videos = get_videos()
         return all_videos.values()
+
+    @strawberry.field
+    def sessions(self, info: strawberry.Info) -> List[SessionInfo]:
+        """
+        Return a list of all active inference sessions.
+
+        Args:
+            info: Strawberry context info containing the inference_api.
+
+        Returns:
+            List[SessionInfo]: A list of metadata for each active session.
+        """
+        inference_api: InferenceAPI = info.context["inference_api"]
+        return inference_api.list_sessions()
 
 
 @strawberry.type
@@ -297,6 +317,56 @@ class Mutation:
             ]
         )
 
+    @strawberry.mutation
+    def download_boxes(
+        self, input: DownloadBoxesInput, info: strawberry.Info
+    ) -> DownloadBoxesResponse:
+        """
+        Retrieve bounding boxes for all frames in the specified session in the requested format.
+        Currently, only YOLO format is supported.
+        
+        Args:
+            input: The DownloadBoxesInput containing the session_id and desired format.
+            info: Strawberry context info containing the inference_api.
+        
+        Returns:
+            A DownloadBoxesResponse with a list of BoxesListOnFrame objects.
+        """
+        inference_api: InferenceAPI = info.context["inference_api"]
+
+        # Reuse the download_masks functionality to get the masks
+        request = DownloadMasksRequest(
+            type="download_masks",
+            session_id=input.session_id,
+        )
+        response = inference_api.download_masks(request=request)
+        
+        import pycocotools.mask as maskUtils
+
+        def rle_to_yolo(rle):
+            # Convert the RLE mask (using counts and size) to YOLO bounding box format.
+            # maskUtils.toBbox returns [x, y, width, height] in absolute coordinates.
+            bbox = maskUtils.toBbox({"counts": rle.counts, "size": rle.size})
+            x, y, w, h = bbox
+            img_h, img_w = rle.size
+            x_center = x + w / 2.0
+            y_center = y + h / 2.0
+            return [x_center / img_w, y_center / img_h, w / img_w, h / img_h]
+
+        boxes_response = []
+        for mask_list in response.results:  # Access 'results' instead of 'masks'
+            boxes_for_frame = []
+            for mask_obj in mask_list.results:  # Access 'results' instead of 'rle_mask_list'
+                yolo_box = rle_to_yolo(mask_obj.mask)  # Use 'mask' from PropagateDataValue
+                boxes_for_frame.append(
+                    YOLOBoxForObject(object_id=mask_obj.object_id, box=yolo_box)
+                )
+            boxes_response.append(
+                BoxesListOnFrame(frame_index=mask_list.frame_index, boxes=boxes_for_frame)
+            )
+        
+        return DownloadBoxesResponse(boxes=boxes_response)
+
 
 def get_file_hash(video_path_or_file) -> str:
     if isinstance(video_path_or_file, str):
@@ -329,7 +399,7 @@ def process_video(
     max_time: float,
     start_time_sec: Optional[float] = None,
     duration_time_sec: Optional[float] = None,
-) -> Tuple[Optional[str], str, str, VideoMetadata]:
+) -> Tuple[Optional[str], str, VideoMetadata]:
     """
     Process file upload including video trimming and content moderation checks.
 

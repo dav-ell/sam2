@@ -68,6 +68,45 @@ class RLEMaskListOnFrame:
 
 
 @strawberry.input
+class DownloadMasksInput:
+    """Input type for the downloadMasks mutation."""
+    session_id: str
+
+
+@strawberry.type
+class DownloadMasksResponse:
+    """Response type for the downloadMasks mutation."""
+    masks: List[RLEMaskListOnFrame]
+
+
+@strawberry.input
+class DownloadBoxesInput:
+    """Input type for the downloadBoxes mutation."""
+    session_id: str
+    format: str  # e.g., "yolo"
+
+
+@strawberry.type
+class YOLOBoxForObject:
+    """Type for a YOLO bounding box associated with a specific object id."""
+    object_id: int
+    box: List[float]  # [x_center, y_center, width, height] normalized between 0 and 1
+
+
+@strawberry.type
+class BoxesListOnFrame:
+    """Type for a list of YOLO bounding boxes on a specific video frame."""
+    frame_index: int
+    boxes: List[YOLOBoxForObject]
+
+
+@strawberry.type
+class DownloadBoxesResponse:
+    """Response type for the downloadBoxes mutation."""
+    boxes: List[BoxesListOnFrame]
+
+
+@strawberry.input
 class StartSessionInput:
     path: str
 
@@ -154,13 +193,11 @@ class SessionExpiration:
     ttl: int
 
 
-@strawberry.input
-class DownloadMasksInput:
-    """Input type for downloading all masks for a session."""
-    session_id: str
-
-
 @strawberry.type
-class DownloadMasksResponse:
-    """Response type containing all masks for all frames in a session."""
-    masks: List[RLEMaskListOnFrame]
+class SessionInfo:
+    """Type representing metadata about an active inference session."""
+    session_id: str
+    start_time: float  # Timestamp when the session was started
+    last_use_time: float  # Timestamp of the last interaction with the session
+    num_frames: int  # Number of frames in the session's video
+    num_objects: int  # Number of tracked objects in the session
