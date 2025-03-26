@@ -4,7 +4,10 @@
 Script to download all video frames for a given session from the SAM 2 backend and save them to disk as JPEG images.
 
 Usage:
-    python download_frames.py [--session-id <SESSION_ID>] --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT>] [--graphql-endpoint <GRAPHQL_ENDPOINT>]
+    python download_frames.py [--session-id <SESSION_ID>] --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT_DOMAIN>]
+
+The endpoint domain should point to the server where the backend is hosted. The script will automatically
+construct the URLs for both the download_frames and GraphQL endpoints by appending '/download_frames' and '/graphql' respectively.
 
 Requirements:
     - pip install requests tqdm
@@ -20,12 +23,12 @@ from email.parser import BytesParser
 from tqdm import tqdm
 
 
-def list_sessions(endpoint: str) -> List[Dict]:
+def list_sessions(graphql_endpoint: str) -> List[Dict]:
     """
     Retrieve a list of active inference sessions from the backend.
 
     Args:
-        endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
+        graphql_endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
 
     Returns:
         A list of dictionaries containing session metadata:
@@ -43,7 +46,7 @@ def list_sessions(endpoint: str) -> List[Dict]:
     Raises:
         Exception: If the GraphQL request fails or the response is invalid.
     """
-    logging.info("Fetching list of active sessions from %s", endpoint)
+    logging.info("Fetching list of active sessions from %s", graphql_endpoint)
     query = """
     query {
         sessions {
@@ -57,7 +60,7 @@ def list_sessions(endpoint: str) -> List[Dict]:
     """
     headers = {"Content-Type": "application/json"}
     try:
-        response = requests.post(endpoint, json={"query": query}, headers=headers, timeout=30)
+        response = requests.post(graphql_endpoint, json={"query": query}, headers=headers, timeout=30)
         response.raise_for_status()
         result = response.json()
         if "errors" in result:
@@ -104,7 +107,7 @@ def select_session(sessions: List[Dict]) -> str:
             print("Please enter a valid number.")
 
 
-def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, bytes], None, None]:
+def download_frames(session_id: str, frames_endpoint: str) -> Generator[Tuple[int, bytes], None, None]:
     """
     Download all video frames for a given session from the backend as a stream of JPEG images.
 
@@ -113,7 +116,7 @@ def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, byte
 
     Args:
         session_id: The ID of the session to download frames for.
-        endpoint: The endpoint URL (e.g., "http://localhost:5000/download_frames").
+        frames_endpoint: The endpoint URL for downloading frames (e.g., "http://localhost:5000/download_frames").
 
     Yields:
         Tuple[int, bytes]: A tuple containing the frame index (int) and JPEG data (bytes).
@@ -122,8 +125,8 @@ def download_frames(session_id: str, endpoint: str) -> Generator[Tuple[int, byte
         requests.RequestException: If the HTTP request fails.
         ValueError: If the response format is invalid.
     """
-    logging.info("Initiating frame download from endpoint %s for session %s", endpoint, session_id)
-    url = endpoint
+    logging.info("Initiating frame download from endpoint %s for session %s", frames_endpoint, session_id)
+    url = frames_endpoint
     payload = {"session_id": session_id}
     headers = {"Content-Type": "application/json"}
 
@@ -223,13 +226,8 @@ def main():
     )
     parser.add_argument(
         "--endpoint",
-        default="http://localhost:5000/download_frames",
-        help="Endpoint URL for downloading frames (default: http://localhost:5000/download_frames)."
-    )
-    parser.add_argument(
-        "--graphql-endpoint",
-        default="http://localhost:5000/graphql",
-        help="GraphQL endpoint URL for listing sessions (default: http://localhost:5000/graphql)."
+        default="http://localhost:5000",
+        help="Endpoint domain where the backend is hosted (default: http://localhost:5000)."
     )
 
     args = parser.parse_args()
@@ -240,6 +238,10 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
+    # Construct the full endpoints for GraphQL and frames based on the provided domain
+    graphql_endpoint = args.endpoint.rstrip("/") + "/graphql"
+    frames_endpoint = args.endpoint.rstrip("/") + "/download_frames"
+
     try:
         # If session_id is provided, use it directly; otherwise, list sessions
         if args.session_id:
@@ -247,7 +249,7 @@ def main():
             logging.info("Using provided session ID: %s", session_id)
         else:
             # Fetch active sessions using the GraphQL endpoint
-            sessions = list_sessions(args.graphql_endpoint)
+            sessions = list_sessions(graphql_endpoint)
             if not sessions:
                 logging.error("No active sessions found")
                 print("No active sessions found. Please start a session first.")
@@ -260,8 +262,8 @@ def main():
                 session_id = select_session(sessions)
         
         logging.info("Starting frame download for session %s", session_id)
-        # Download frames from the backend using the frames endpoint
-        frames = download_frames(session_id, args.endpoint)
+        # Download frames from the backend using the constructed frames endpoint
+        frames = download_frames(session_id, frames_endpoint)
         # Save frames to disk
         save_frames_to_disk(frames, args.output_dir)
         logging.info("Successfully downloaded and saved frames to %s", args.output_dir)

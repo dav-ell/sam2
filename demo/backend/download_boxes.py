@@ -4,9 +4,11 @@
 Script to download bounding boxes for a given session from the SAM 2 backend and save them to disk as YOLO format bounding boxes.
 
 Usage:
-    python download_boxes.py [--session-id <SESSION_ID>] --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT>]
+    python download_boxes.py [--session-id <SESSION_ID>] --output-dir <OUTPUT_DIR> [--endpoint <ENDPOINT_DOMAIN>]
 
 If --session-id is not provided, the script will query active sessions and either use the only available session or prompt the user to select one if multiple sessions exist.
+
+The endpoint domain should point to the server where the backend is hosted. The script will automatically construct the GraphQL endpoint URL by appending '/graphql'.
 
 Requirements:
     - pip install requests tqdm
@@ -15,18 +17,19 @@ Requirements:
 import argparse
 import logging
 import os
+import math
 from typing import List, Dict
 
 import requests
 from tqdm import tqdm
 
 
-def list_sessions(endpoint: str) -> List[Dict]:
+def list_sessions(graphql_endpoint: str) -> List[Dict]:
     """
     Retrieve a list of active inference sessions from the backend.
 
     Args:
-        endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
+        graphql_endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
 
     Returns:
         A list of dictionaries containing session metadata:
@@ -44,7 +47,7 @@ def list_sessions(endpoint: str) -> List[Dict]:
     Raises:
         Exception: If the GraphQL request fails or the response is invalid.
     """
-    logging.info("Fetching list of active sessions from %s", endpoint)
+    logging.info("Fetching list of active sessions from %s", graphql_endpoint)
     query = """
     query {
         sessions {
@@ -58,7 +61,7 @@ def list_sessions(endpoint: str) -> List[Dict]:
     """
     headers = {"Content-Type": "application/json"}
     try:
-        response = requests.post(endpoint, json={"query": query}, headers=headers, timeout=30)
+        response = requests.post(graphql_endpoint, json={"query": query}, headers=headers, timeout=30)
         response.raise_for_status()
         result = response.json()
         if "errors" in result:
@@ -71,13 +74,13 @@ def list_sessions(endpoint: str) -> List[Dict]:
         raise Exception(f"Failed to list sessions: {str(e)}")
 
 
-def download_boxes(session_id: str, endpoint: str) -> List[Dict]:
+def download_boxes(session_id: str, graphql_endpoint: str) -> List[Dict]:
     """
     Download bounding boxes for a given session from the backend.
 
     Args:
         session_id: The ID of the session to download bounding boxes for.
-        endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
+        graphql_endpoint: The GraphQL endpoint URL (e.g., "http://localhost:5000/graphql").
 
     Returns:
         A list of dictionaries containing frame_index and boxes data.
@@ -96,8 +99,7 @@ def download_boxes(session_id: str, endpoint: str) -> List[Dict]:
     Raises:
         Exception: If the GraphQL request fails or the response is invalid.
     """
-    logging.info("Setting up GraphQL query for endpoint %s", endpoint)
-    # GraphQL mutation for downloading boxes
+    logging.info("Setting up GraphQL query for endpoint %s", graphql_endpoint)
     query = """
     mutation DownloadBoxes($input: DownloadBoxesInput!) {
         downloadBoxes(input: $input) {
@@ -119,7 +121,7 @@ def download_boxes(session_id: str, endpoint: str) -> List[Dict]:
     }
     headers = {"Content-Type": "application/json"}
     try:
-        response = requests.post(endpoint, json={"query": query, "variables": variables}, headers=headers, timeout=3600)
+        response = requests.post(graphql_endpoint, json={"query": query, "variables": variables}, headers=headers, timeout=3600)
         response.raise_for_status()
         result = response.json()
         if "errors" in result:
@@ -136,7 +138,14 @@ def save_boxes_to_disk(boxes: List[Dict], output_dir: str) -> None:
     """
     Save the downloaded bounding boxes to disk as text files.
     Each file is named 'frame_%06d.txt' corresponding to the frame index.
+    Boxes with invalid dimensions or out-of-bound values are filtered out.
 
+    Invalid box checks:
+      - The box must be a list of exactly 4 elements.
+      - All elements must be numeric and finite.
+      - x_center_norm and y_center_norm must be within [0, 1].
+      - width_norm and height_norm must be > 0 and within (0, 1].
+      
     Args:
         boxes: List of dictionaries containing bounding boxes per frame.
         output_dir: Directory where the text files will be saved.
@@ -147,12 +156,40 @@ def save_boxes_to_disk(boxes: List[Dict], output_dir: str) -> None:
     for frame_data in tqdm(boxes, desc="Saving boxes", unit="frame"):
         frame_index = frame_data["frameIndex"]
         filename = os.path.join(output_dir, f"frame_{frame_index:06d}.txt")
-        # Each line: "<object_id> <x_center_norm> <y_center_norm> <width_norm> <height_norm>"
         lines = []
         for box_obj in frame_data["boxes"]:
             object_id = box_obj["objectId"]
             box_values = box_obj["box"]
-            line = "{} {:.6f} {:.6f} {:.6f} {:.6f}".format(object_id, box_values[0], box_values[1], box_values[2], box_values[3])
+
+            # Check that box_values is a list of exactly 4 elements.
+            if not isinstance(box_values, list) or len(box_values) != 4:
+                logging.warning("Skipping invalid bounding box for frame %d: expected list of 4 elements, got %s", frame_index, box_values)
+                continue
+
+            # Check that all values are numeric and finite.
+            if not all(isinstance(val, (int, float)) for val in box_values):
+                logging.warning("Skipping invalid bounding box for frame %d: non-numeric values in %s", frame_index, box_values)
+                continue
+            if any(not math.isfinite(val) for val in box_values):
+                logging.warning("Skipping invalid bounding box for frame %d: non-finite values in %s", frame_index, box_values)
+                continue
+
+            x_center, y_center, width, height = box_values
+
+            # Check that center coordinates are within [0, 1].
+            if not (0 <= x_center <= 1) or not (0 <= y_center <= 1):
+                logging.warning("Skipping invalid bounding box for frame %d: center coordinates out of range (x=%.6f, y=%.6f)", frame_index, x_center, y_center)
+                continue
+
+            # Check that width and height are greater than 0 and within (0, 1].
+            if width <= 0 or height <= 0:
+                logging.warning("Skipping invalid bounding box for frame %d: non-positive dimensions (width=%.6f, height=%.6f)", frame_index, width, height)
+                continue
+            if width > 1 or height > 1:
+                logging.warning("Skipping invalid bounding box for frame %d: dimensions exceed normalized range (width=%.6f, height=%.6f)", frame_index, width, height)
+                continue
+
+            line = "{} {:.6f} {:.6f} {:.6f} {:.6f}".format(object_id, x_center, y_center, width, height)
             lines.append(line)
         with open(filename, "w") as f:
             f.write("\n".join(lines))
@@ -209,22 +246,24 @@ def main():
     )
     parser.add_argument(
         "--endpoint",
-        default="http://localhost:5000/graphql",
-        help="GraphQL endpoint URL (default: http://localhost:5000/graphql)."
+        default="http://localhost:5000",
+        help="Endpoint domain where the backend is hosted (default: http://localhost:5000)."
     )
     
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     
+    # Construct the GraphQL endpoint URL by appending '/graphql'
+    graphql_endpoint = args.endpoint.rstrip("/") + "/graphql"
+    
     try:
-        # If session_id is provided, use it directly
+        # If session_id is provided, use it directly; otherwise, fetch active sessions.
         if args.session_id:
             session_id = args.session_id
             logging.info("Using provided session ID: %s", session_id)
         else:
-            # Fetch active sessions
-            sessions = list_sessions(args.endpoint)
+            sessions = list_sessions(graphql_endpoint)
             if not sessions:
                 logging.error("No active sessions found")
                 print("No active sessions found. Please start a session first.")
@@ -237,7 +276,7 @@ def main():
                 session_id = select_session(sessions)
         
         logging.info("Starting bounding boxes download for session %s", session_id)
-        boxes = download_boxes(session_id, args.endpoint)
+        boxes = download_boxes(session_id, graphql_endpoint)
         if not boxes:
             logging.warning("No bounding boxes found for session %s", session_id)
             print(f"No bounding boxes found for session {session_id}.")
