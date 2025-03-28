@@ -7,6 +7,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+import logging
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -60,7 +61,9 @@ from inference.data_types import (
 from inference.inference_api import InferenceAPI
 from strawberry import relay
 from strawberry.file_uploads import Upload
+from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
 
 @strawberry.type
 class Query:
@@ -405,23 +408,40 @@ def process_video(
 
     Returns the filepath, s3_file_key, hash & video metaedata as a tuple.
     """
+    logger.info("Starting file upload processing.")
+
+    # Initialize a tqdm progress bar to simulate file processing progress.
+    progress_bar = tqdm(total=100, desc="File Processing", ncols=80, leave=False)
+
     with tempfile.TemporaryDirectory() as tempdir:
         in_path = f"{tempdir}/in.mp4"
         out_path = f"{tempdir}/out.mp4"
         with open(in_path, "wb") as in_f:
             in_f.write(file.read())
+        logger.info(f"Uploaded file written to temporary location: {in_path}")
+        progress_bar.update(25)
 
         try:
             video_metadata = get_video_metadata(in_path)
+            logger.info(f"Video metadata extracted: duration={video_metadata.duration_sec}, "
+                        f"resolution=({video_metadata.width}x{video_metadata.height}), fps={video_metadata.fps}")
         except av.InvalidDataError:
+            logger.error("Invalid video file provided.")
+            progress_bar.close()
             raise Exception("not valid video file")
 
         if video_metadata.num_video_streams == 0:
+            logger.error("Video container does not contain a video stream.")
+            progress_bar.close()
             raise Exception("video container does not contain a video stream")
         if video_metadata.width is None or video_metadata.height is None:
+            logger.error("Video container does not contain width or height metadata.")
+            progress_bar.close()
             raise Exception("video container does not contain width or height metadata")
 
         if video_metadata.duration_sec in (None, 0):
+            logger.error("Video container does not have duration metadata.")
+            progress_bar.close()
             raise Exception("video container does time duration metadata")
 
         start_time_sec, duration_time_sec = _get_start_sec_duration_sec(
@@ -429,9 +449,12 @@ def process_video(
             start_time_sec=start_time_sec,
             duration_time_sec=duration_time_sec,
         )
+        logger.info(f"Video processing parameters set: start_time_sec={start_time_sec}, duration_time_sec={duration_time_sec}")
+        progress_bar.update(25)
 
         # Transcode video to make sure videos returned to the app are all in
         # the same format, duration, resolution, fps.
+        logger.info("Starting video transcoding process.")
         transcode(
             in_path,
             out_path,
@@ -439,11 +462,15 @@ def process_video(
             seek_t=start_time_sec,
             duration_time_sec=duration_time_sec,
         )
+        logger.info("Video transcoding completed.")
+        progress_bar.update(25)
 
         os.remove(in_path)  # don't need original video now
 
         out_video_metadata = get_video_metadata(out_path)
         if out_video_metadata.num_video_frames == 0:
+            logger.error("Transcode produced empty video.")
+            progress_bar.close()
             raise Exception(
                 "transcode produced empty video; check seek time or your input video"
             )
@@ -456,9 +483,11 @@ def process_video(
 
             file_key = UPLOADS_PREFIX + "/" + f"{file_hash}.mp4"
             filepath = os.path.join(UPLOADS_PATH, f"{file_hash}.mp4")
-
         assert filepath is not None and file_key is not None
         shutil.move(out_path, filepath)
+        logger.info(f"Processed video moved to destination: {filepath}")
+        progress_bar.update(25)
+        progress_bar.close()
 
         return filepath, file_key, out_video_metadata
 

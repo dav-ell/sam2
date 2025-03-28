@@ -109,7 +109,7 @@ def clear_points_in_video_operation(predictor, inference_state, request) -> Clea
         ClearPointsInVideoResponse: Confirmation of the clearing operation.
     """
     predictor.reset_state(inference_state)
-    from data.data_types import ClearPointsInVideoResponse
+    from inference.data_types import ClearPointsInVideoResponse
     return ClearPointsInVideoResponse(success=True)
 
 def remove_object_operation(predictor, inference_state, request, score_thresh=0) -> RemoveObjectResponse:
@@ -131,7 +131,7 @@ def remove_object_operation(predictor, inference_state, request, score_thresh=0)
         masks_binary = (video_res_masks > score_thresh)[:, 0].cpu().numpy()
         rle_mask_list = get_rle_mask_list(new_obj_ids, masks_binary)
         results.append(PropagateDataResponse(frame_index=frame_index, results=rle_mask_list))
-    from data.data_types import RemoveObjectResponse
+    from inference.data_types import RemoveObjectResponse
     return RemoveObjectResponse(results=results)
 
 def propagate_in_video_operation(predictor, inference_state, request, session, score_thresh=0) -> Generator[PropagateDataResponse, None, None]:
